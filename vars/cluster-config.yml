@@ -1,0 +1,29 @@
+---
+# Cluster settings
+cluster_name: "test"
+worker_count: 2
+
+# Control plane VM specifications
+control_plane:
+  cpus: 2
+  memory: "2G"
+  disk: "20G"
+
+# Worker VM specifications
+worker:
+  cpus: 1
+  memory: "1.5G"
+  disk: "15G"
+
+# OS settings
+ubuntu_version: "22.04"
+
+# Network settings
+network_interface: "en0"
+pod_network_cidr: "10.244.0.0/16"
+
+# Kubernetes settings
+kubernetes_version: "1.31"
+flannel_version: "v0.26.1"
+ingress_nginx_version: "v1.9.4"
+local_path_provisioner_version: "v0.0.26"
