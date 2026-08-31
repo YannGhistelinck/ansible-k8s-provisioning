@@ -1,0 +1,41 @@
+# Legacy sources (imported progressively, not versioned)
+_legacy/
+
+# Ansible
+*.retry
+vault_password_file
+*.vault_pass
+inventory/*.auto
+
+# SSH keys and secrets
+*.pem
+*.key
+id_rsa*
+*.crt
+*.csr
+
+# Python / virtualenv
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Multipass
+cloud-init-*.yaml.rendered
+
+# Temporary files
+*.tmp
+*.bak
+*.log
