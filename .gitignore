@@ -13,6 +13,7 @@ inventory/*.auto
 id_rsa*
 *.crt
 *.csr
+.env
 
 # Python / virtualenv
 __pycache__/
