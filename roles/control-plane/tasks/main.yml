@@ -1,0 +1,109 @@
+---
+# Control plane initialization
+# Runs kubeadm init, deploys CNI and cluster add-ons, generates join command
+
+# --- Kubernetes initialization ---
+
+- name: Get control plane IP address
+  set_fact:
+    control_plane_ip: "{{ ansible_default_ipv4.address }}"
+
+- name: Check if kubeadm has already been initialized
+  stat:
+    path: /etc/kubernetes/admin.conf
+  register: kubeadm_init_status
+  become: yes
+
+- name: Initialize Kubernetes control plane
+  command: >
+    kubeadm init
+    --apiserver-advertise-address={{ control_plane_ip }}
+    --pod-network-cidr={{ pod_network_cidr }}
+  become: yes
+  when: not kubeadm_init_status.stat.exists
+  register: kubeadm_init_output
+
+# --- Kubectl configuration ---
+
+- name: Create .kube directory for user
+  file:
+    path: "{{ ansible_env.HOME }}/.kube"
+    state: directory
+    mode: '0755'
+
+- name: Copy admin.conf to user kubeconfig
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: "{{ ansible_env.HOME }}/.kube/config"
+    remote_src: yes
+    owner: "{{ ansible_env.USER }}"
+    group: "{{ ansible_env.USER }}"
+    mode: '0644'
+  become: yes
+
+# --- Cluster networking and add-ons ---
+
+- name: Install Flannel CNI
+  command: >
+    kubectl apply -f
+    https://raw.githubusercontent.com/flannel-io/flannel/{{ flannel_version }}/Documentation/kube-flannel.yml
+  environment:
+    KUBECONFIG: "{{ ansible_env.HOME }}/.kube/config"
+  when: not kubeadm_init_status.stat.exists
+  retries: 3
+  delay: 5
+  register: flannel_result
+  until: flannel_result.rc == 0
+
+- name: Install local-path-provisioner
+  command: >
+    kubectl apply -f
+    https://raw.githubusercontent.com/rancher/local-path-provisioner/{{ local_path_provisioner_version }}/deploy/local-path-storage.yaml
+  environment:
+    KUBECONFIG: "{{ ansible_env.HOME }}/.kube/config"
+  when: not kubeadm_init_status.stat.exists
+  retries: 3
+  delay: 5
+  register: local_path_result
+  until: local_path_result.rc == 0
+
+- name: Set local-path as default StorageClass
+  command: >
+    kubectl patch storageclass local-path
+    -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+  environment:
+    KUBECONFIG: "{{ ansible_env.HOME }}/.kube/config"
+  when: not kubeadm_init_status.stat.exists
+
+- name: Install Ingress NGINX controller
+  command: >
+    kubectl apply -f
+    https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-{{ ingress_nginx_version }}/deploy/static/provider/baremetal/deploy.yaml
+  environment:
+    KUBECONFIG: "{{ ansible_env.HOME }}/.kube/config"
+  when: not kubeadm_init_status.stat.exists
+  retries: 3
+  delay: 5
+  register: ingress_result
+  until: ingress_result.rc == 0
+
+# --- Join command for workers ---
+
+- name: Generate join command
+  command: kubeadm token create --print-join-command
+  become: yes
+  register: join_command_output
+
+- name: Save join command to file
+  copy:
+    content: "{{ join_command_output.stdout }}"
+    dest: "{{ ansible_env.HOME }}/kubeadm-join-command.sh"
+    mode: '0755'
+
+- name: Set join command as fact for worker nodes
+  set_fact:
+    kubeadm_join_command: "{{ join_command_output.stdout }}"
+
+- name: Display join command
+  debug:
+    msg: "Join command: {{ join_command_output.stdout }}"
