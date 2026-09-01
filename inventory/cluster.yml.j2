@@ -1,0 +1,15 @@
+---
+all:
+  children:
+    control_plane:
+      hosts:
+        {{ cluster_name }}-cplane:
+          ansible_host: {{ cluster_name }}-cplane
+          ansible_connection: multipass
+    workers:
+      hosts:
+{% for i in range(worker_count) %}
+        {{ cluster_name }}-worker-{{ i + 1 }}:
+          ansible_host: {{ cluster_name }}-worker-{{ i + 1 }}
+          ansible_connection: multipass
+{% endfor %}

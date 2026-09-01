@@ -1,0 +1,154 @@
+---
+# Playbook: Create a full Kubernetes cluster
+# Creates Multipass VMs, configures them, initializes the control plane,
+# joins workers, and labels nodes.
+
+- name: Create Multipass VMs for Kubernetes cluster
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - vars/cluster-config.yml
+  tasks:
+    - name: Clean old inventory file
+      file:
+        path: "{{ playbook_dir }}/inventory/cluster.yml"
+        state: absent
+
+    # --- VM creation ---
+
+    - name: Create control plane VM
+      command: >
+        multipass launch
+        --name {{ cluster_name }}-cplane
+        --cpus {{ control_plane.cpus }}
+        --memory {{ control_plane.memory }}
+        --disk {{ control_plane.disk }}
+        --network {{ network_interface }}
+        {{ ubuntu_version }}
+      register: cplane_create
+      ignore_errors: yes
+
+    - name: Create worker VMs
+      command: >
+        multipass launch
+        --name {{ cluster_name }}-worker-{{ item }}
+        --cpus {{ worker.cpus }}
+        --memory {{ worker.memory }}
+        --disk {{ worker.disk }}
+        --network {{ network_interface }}
+        {{ ubuntu_version }}
+      loop: "{{ range(1, worker_count + 1) | list }}"
+      register: workers_create
+      ignore_errors: yes
+
+    - name: Wait for VMs to be ready
+      pause:
+        seconds: 10
+
+    # --- IP discovery ---
+    # Each VM gets two IPs: ipv4[0] is the internal Multipass network,
+    # ipv4[1] is the bridged network interface. We use ipv4[1] for display.
+
+    - name: Get control plane info
+      command: multipass info {{ cluster_name }}-cplane --format json
+      register: cplane_info_raw
+
+    - name: Extract control plane IP
+      set_fact:
+        cplane_ip: "{{ (cplane_info_raw.stdout | from_json).info[cluster_name + '-cplane'].ipv4[1] }}"
+
+    - name: Get worker info
+      command: multipass info {{ cluster_name }}-worker-{{ item }} --format json
+      loop: "{{ range(1, worker_count + 1) | list }}"
+      register: workers_info_raw
+
+    - name: Extract worker IPs
+      set_fact:
+        worker_ips: >-
+          {{ worker_ips | default([]) +
+             [(item.stdout | from_json).info[cluster_name + '-worker-' + ((loop_index + 1) | string)].ipv4[1]] }}
+      loop: "{{ workers_info_raw.results }}"
+      loop_control:
+        loop_var: item
+        index_var: loop_index
+
+    # --- Dynamic inventory ---
+
+    - name: Add control plane to in-memory inventory
+      add_host:
+        name: "{{ cluster_name }}-cplane"
+        groups: control_plane
+        ansible_host: "{{ cluster_name }}-cplane"
+        ansible_connection: multipass
+
+    - name: Add workers to in-memory inventory
+      add_host:
+        name: "{{ cluster_name }}-worker-{{ item + 1 }}"
+        groups: workers
+        ansible_host: "{{ cluster_name }}-worker-{{ item + 1 }}"
+        ansible_connection: multipass
+      loop: "{{ range(0, worker_count) | list }}"
+
+    - name: Generate inventory file from template
+      template:
+        src: "{{ playbook_dir }}/inventory/cluster.yml.j2"
+        dest: "{{ playbook_dir }}/inventory/cluster.yml"
+
+    - name: Display cluster information
+      debug:
+        msg:
+          - "Control plane: {{ cluster_name }}-cplane ({{ cplane_ip }})"
+          - "Workers: {% for i in range(worker_count) %}{{ cluster_name }}-worker-{{ i + 1 }} ({{ worker_ips[i] }}){% if not loop.last %}, {% endif %}{% endfor %}"
+
+# --- Node configuration ---
+
+- name: Configure all nodes with common prerequisites
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - vars/cluster-config.yml
+  roles:
+    - common
+
+- name: Initialize control plane
+  hosts: control_plane
+  gather_facts: yes
+  vars_files:
+    - vars/cluster-config.yml
+  roles:
+    - control-plane
+
+- name: Join worker nodes to the cluster
+  hosts: workers
+  gather_facts: yes
+  vars_files:
+    - vars/cluster-config.yml
+  roles:
+    - worker
+
+# --- Post-configuration ---
+
+- name: Label worker nodes
+  hosts: control_plane
+  gather_facts: no
+  vars_files:
+    - vars/cluster-config.yml
+  tasks:
+    - name: Label worker nodes with role
+      command: >
+        kubectl label node {{ cluster_name }}-worker-{{ item }}
+        node-role.kubernetes.io/worker=worker --overwrite
+      environment:
+        KUBECONFIG: "{{ ansible_env.HOME }}/.kube/config"
+      loop: "{{ range(1, worker_count + 1) | list }}"
+
+    - name: Get cluster status
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: "{{ ansible_env.HOME }}/.kube/config"
+      register: nodes_output
+
+    - name: Display cluster status
+      debug:
+        msg: "{{ nodes_output.stdout_lines }}"

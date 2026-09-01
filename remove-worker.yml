@@ -1,0 +1,139 @@
+---
+# Playbook: Remove a worker node from an existing cluster
+# Uses LIFO strategy: always removes the worker with the highest index.
+# Performs graceful drain before VM deletion when control plane is accessible.
+
+- name: Remove worker node from Kubernetes cluster
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - vars/cluster-config.yml
+  tasks:
+
+    # --- Discover target worker ---
+
+    - name: Get list of existing VMs
+      command: multipass list --format json
+      register: vm_list_raw
+
+    - name: Parse VM list
+      set_fact:
+        vm_list: "{{ vm_list_raw.stdout | from_json }}"
+
+    - name: Extract existing worker names
+      set_fact:
+        existing_workers: "{{ vm_list.list | selectattr('name', 'match', '^' + cluster_name + '-worker-.*') | map(attribute='name') | list }}"
+
+    - name: Fail if no workers exist
+      fail:
+        msg: "No workers found for cluster '{{ cluster_name }}'. Available VMs: {{ vm_list.list | map(attribute='name') | list }}"
+      when: existing_workers | length == 0
+
+    - name: Find highest worker number
+      set_fact:
+        max_worker_num: "{{ existing_workers | map('regex_replace', '^' + cluster_name + '-worker-(\\d+)$', '\\1') | map('int') | max }}"
+
+    - name: Set target worker name
+      set_fact:
+        target_worker_name: "{{ cluster_name }}-worker-{{ max_worker_num }}"
+
+    - name: Display removal target
+      debug:
+        msg:
+          - "Found {{ existing_workers | length }} worker(s): {{ existing_workers | join(', ') }}"
+          - "Removing: {{ target_worker_name }}"
+
+    # --- Graceful removal from cluster ---
+
+    - name: Check if control plane is accessible
+      command: >
+        multipass exec {{ cluster_name }}-cplane --
+        kubectl get nodes
+      register: cplane_check
+      ignore_errors: yes
+
+    - name: Warn if control plane is not accessible
+      debug:
+        msg: "WARNING: Control plane is not accessible. Will only delete the VM without draining."
+      when: cplane_check.rc != 0
+
+    - name: Check if node exists in cluster
+      command: >
+        multipass exec {{ cluster_name }}-cplane --
+        kubectl get node {{ target_worker_name }} -o json
+      register: node_info
+      ignore_errors: yes
+      when: cplane_check.rc == 0
+
+    - name: Set node cluster membership status
+      set_fact:
+        node_in_cluster: "{{ (cplane_check.rc == 0) and (node_info.rc | default(1) == 0) }}"
+
+    - name: Cordon the node
+      command: >
+        multipass exec {{ cluster_name }}-cplane --
+        kubectl cordon {{ target_worker_name }}
+      when: node_in_cluster
+      ignore_errors: yes
+
+    - name: Drain the node
+      command: >
+        multipass exec {{ cluster_name }}-cplane --
+        kubectl drain {{ target_worker_name }}
+        --ignore-daemonsets
+        --delete-emptydir-data
+        --force
+        --timeout=120s
+      register: drain_result
+      when: node_in_cluster
+      ignore_errors: yes
+
+    - name: Warn if drain failed
+      debug:
+        msg: "WARNING: Failed to drain {{ target_worker_name }}. Proceeding with deletion."
+      when:
+        - drain_result is defined
+        - drain_result is failed
+
+    - name: Delete node from cluster
+      command: >
+        multipass exec {{ cluster_name }}-cplane --
+        kubectl delete node {{ target_worker_name }}
+      when: node_in_cluster
+      ignore_errors: yes
+
+    # --- VM cleanup ---
+
+    - name: Stop worker VM
+      command: multipass stop {{ target_worker_name }}
+      ignore_errors: yes
+
+    - name: Delete worker VM
+      command: multipass delete {{ target_worker_name }}
+
+    - name: Purge deleted VM
+      command: multipass purge
+
+    # --- Summary ---
+
+    - name: Get cluster status
+      command: >
+        multipass exec {{ cluster_name }}-cplane --
+        kubectl get nodes
+      register: final_nodes
+      when: cplane_check.rc == 0
+      ignore_errors: yes
+
+    - name: Display cluster status
+      debug:
+        msg: "{{ final_nodes.stdout_lines }}"
+      when:
+        - cplane_check.rc == 0
+        - final_nodes is defined
+        - final_nodes.rc == 0
+
+    - name: Display summary
+      debug:
+        msg:
+          - "Worker {{ target_worker_name }} removed successfully"
+          - "VM deleted and purged from Multipass"

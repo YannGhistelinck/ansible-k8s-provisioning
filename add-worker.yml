@@ -1,0 +1,169 @@
+---
+# Playbook: Add a new worker node to an existing cluster
+# Uses LIFO strategy: new worker gets the next available number (max + 1)
+
+- name: Add a new worker node to existing Kubernetes cluster
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - vars/cluster-config.yml
+  tasks:
+
+    # --- Discover existing workers ---
+
+    - name: Get list of existing VMs
+      command: multipass list --format json
+      register: vm_list_raw
+
+    - name: Parse VM list
+      set_fact:
+        vm_list: "{{ vm_list_raw.stdout | from_json }}"
+
+    - name: Extract existing worker names
+      set_fact:
+        existing_workers: "{{ vm_list.list | selectattr('name', 'match', '^' + cluster_name + '-worker-.*') | map(attribute='name') | list }}"
+
+    - name: Find highest worker number
+      set_fact:
+        max_worker_num: "{{ existing_workers | map('regex_replace', '^' + cluster_name + '-worker-(\\d+)$', '\\1') | map('int') | max | default(0) }}"
+      when: existing_workers | length > 0
+
+    - name: Set max worker number to 0 if no workers exist
+      set_fact:
+        max_worker_num: 0
+      when: existing_workers | length == 0
+
+    - name: Calculate next worker number
+      set_fact:
+        next_worker_number: "{{ worker_number if worker_number is defined else (max_worker_num | int + 1) }}"
+
+    - name: Set new worker name
+      set_fact:
+        new_worker_name: "{{ cluster_name }}-worker-{{ next_worker_number }}"
+
+    - name: Check if worker VM already exists
+      fail:
+        msg: "Worker {{ new_worker_name }} already exists. Use a different worker_number or remove the existing worker first."
+      when: new_worker_name in (vm_list.list | map(attribute='name') | list)
+
+    # --- Create VM ---
+
+    - name: Display new worker information
+      debug:
+        msg:
+          - "Creating new worker: {{ new_worker_name }}"
+          - "Specs: {{ worker.cpus }} CPUs, {{ worker.memory }} RAM, {{ worker.disk }} disk"
+
+    - name: Create new worker VM
+      command: >
+        multipass launch
+        --name {{ new_worker_name }}
+        --cpus {{ worker.cpus }}
+        --memory {{ worker.memory }}
+        --disk {{ worker.disk }}
+        --network {{ network_interface }}
+        {{ ubuntu_version }}
+
+    - name: Wait for VM to be ready
+      pause:
+        seconds: 10
+
+    - name: Get new worker info
+      command: multipass info {{ new_worker_name }} --format json
+      register: worker_info_raw
+
+    - name: Extract worker IP
+      set_fact:
+        worker_ip: "{{ (worker_info_raw.stdout | from_json).info[new_worker_name].ipv4[1] }}"
+
+    - name: Display worker IP
+      debug:
+        msg: "Worker {{ new_worker_name }} created with IP: {{ worker_ip }}"
+
+    # --- Get join command from control plane ---
+
+    - name: Generate join command with short-lived token
+      command: >
+        multipass exec {{ cluster_name }}-cplane --
+        sudo kubeadm token create --print-join-command --ttl 10m
+      register: join_command_output
+
+    - name: Set join command as fact
+      set_fact:
+        kubeadm_join_command: "{{ join_command_output.stdout }}"
+
+    # --- Add to inventory ---
+
+    - name: Add new worker to in-memory inventory
+      add_host:
+        name: "{{ new_worker_name }}"
+        groups: new_worker
+        ansible_host: "{{ new_worker_name }}"
+        ansible_connection: multipass
+
+# --- Configure and join ---
+
+- name: Configure new worker with common prerequisites
+  hosts: new_worker
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - vars/cluster-config.yml
+  roles:
+    - common
+
+- name: Join worker node to cluster
+  hosts: new_worker
+  gather_facts: no
+  vars_files:
+    - vars/cluster-config.yml
+  tasks:
+    - name: Check if node is already part of the cluster
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf_status
+      become: yes
+
+    - name: Join the Kubernetes cluster
+      command: "{{ hostvars['localhost']['kubeadm_join_command'] }}"
+      become: yes
+      when: not kubelet_conf_status.stat.exists
+
+    - name: Wait for kubelet to register with the cluster
+      pause:
+        seconds: 10
+      when: not kubelet_conf_status.stat.exists
+
+# --- Label and verify ---
+
+- name: Label new worker node
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - vars/cluster-config.yml
+  tasks:
+    - name: Label worker node with role
+      command: >
+        multipass exec {{ cluster_name }}-cplane --
+        kubectl label node {{ new_worker_name }}
+        node-role.kubernetes.io/worker=worker --overwrite
+      retries: 5
+      delay: 5
+      register: label_result
+      until: label_result.rc == 0
+
+    - name: Get cluster status
+      command: >
+        multipass exec {{ cluster_name }}-cplane --
+        kubectl get nodes
+      register: nodes_output
+
+    - name: Display cluster status
+      debug:
+        msg: "{{ nodes_output.stdout_lines }}"
+
+    - name: Display summary
+      debug:
+        msg:
+          - "Worker {{ new_worker_name }} added successfully"
+          - "IP: {{ worker_ip }}"
